@@ -22,6 +22,7 @@ Configuration is via environment variables (or a .env file next to the script):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -95,6 +96,15 @@ class Listing:
 
     def in_zurich(self) -> bool:
         return bool(ZURICH_PATTERN.search(self.city or ""))
+
+    def fingerprint(self) -> str:
+        """Content hash. WOKO reuses the same oid when a room is re-listed,
+        so an oid alone is not enough to tell 'new' from 'seen'."""
+        raw = "|".join(
+            re.sub(r"\s+", " ", x).strip().lower()
+            for x in (self.title, self.status, self.available, self.address, self.city, self.rent)
+        )
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
     def pretty(self) -> str:
         return (
@@ -196,19 +206,26 @@ def parse_listings(html: str) -> list[Listing]:
 # --------------------------------------------------------------------------- #
 # State
 # --------------------------------------------------------------------------- #
-def load_seen(path: Path) -> set[str]:
+def load_seen(path: Path) -> dict[str, str]:
+    """Returns {oid: fingerprint}. Accepts the old format (a plain list of
+    oids) by mapping each to an empty fingerprint, so the first run after
+    upgrading treats every unchanged listing as already seen."""
     if not path.exists():
-        return set()
+        return {}
     try:
-        return set(json.loads(path.read_text(encoding="utf-8")).get("seen", []))
+        data = json.loads(path.read_text(encoding="utf-8")).get("seen", {})
     except (json.JSONDecodeError, AttributeError):
-        return set()
+        return {}
+    if isinstance(data, list):
+        return {str(oid): "" for oid in data}
+    return {str(k): str(v) for k, v in data.items()}
 
 
-def save_seen(path: Path, seen: set[str]) -> None:
+def save_seen(path: Path, seen: dict[str, str]) -> None:
+    ordered = {k: seen[k] for k in sorted(seen, key=int)}
     path.write_text(
         json.dumps(
-            {"seen": sorted(seen, key=int), "updated": datetime.now().isoformat(timespec="seconds")},
+            {"seen": ordered, "updated": datetime.now().isoformat(timespec="seconds")},
             indent=2,
         ),
         encoding="utf-8",
@@ -229,7 +246,7 @@ def send_email(new: list[Listing]) -> None:
         )
 
     n = len(new)
-    subject = f"[WOKO] {n} new room{'s' if n != 1 else ''} in Zürich: " + \
+    subject = f"[WOKO] {n} new/updated room{'s' if n != 1 else ''} in Zürich: " + \
         "; ".join(f"{l.rent} {l.address}" for l in new[:3])
 
     body = "\n\n".join(l.pretty() for l in new) + f"\n\nAll listings: {URL}\n"
@@ -288,29 +305,40 @@ def main() -> int:
     ]
 
     seen = load_seen(state_file)
+    current = {l.oid: l.fingerprint() for l in listings}
+
+    # New = never seen this oid. Updated = same oid, but the content changed
+    # (WOKO re-lists rooms under the same oid). An empty stored fingerprint
+    # means "known from the old list-format state": accept silently.
     new = [l for l in wanted if l.oid not in seen]
+    updated = [
+        l for l in wanted
+        if l.oid in seen and seen[l.oid] and seen[l.oid] != l.fingerprint()
+    ]
+    alerts = new + updated
 
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     if args.init:
-        save_seen(state_file, seen | {l.oid for l in listings})
+        save_seen(state_file, {**seen, **current})
         print(f"[{stamp}] Initialised: {len(listings)} listings marked as seen ({len(wanted)} match your filter).")
         return 0
 
-    if not new:
+    if not alerts:
         print(f"[{stamp}] {len(listings)} listings, {len(wanted)} match filter, nothing new.")
     else:
-        print(f"[{stamp}] {len(new)} NEW listing(s):")
-        for l in new:
-            print(l.pretty(), "\n")
+        print(f"[{stamp}] {len(new)} NEW, {len(updated)} UPDATED listing(s):")
+        for l in alerts:
+            tag = "NEW" if l in new else "UPDATED"
+            print(f"[{tag}]", l.pretty(), "\n")
         if not args.dry_run:
-            send_email(new)
+            send_email(alerts)
             print("Email sent.")
 
-    # Remember every oid we've observed (not just matches) so a later filter
-    # change doesn't re-alert on old listings. Dry runs leave state untouched
-    # so you can re-run them while testing.
+    # Remember every listing we've observed (not just matches) so a later
+    # filter change doesn't re-alert on old listings. Dry runs leave state
+    # untouched so you can re-run them while testing.
     if not args.dry_run:
-        save_seen(state_file, seen | {l.oid for l in listings})
+        save_seen(state_file, {**seen, **current})
     return 0
 
 

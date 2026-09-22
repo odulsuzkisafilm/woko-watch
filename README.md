@@ -8,8 +8,10 @@ https://www.woko.ch/unser-angebot/freie-objekte.
 Each listing on the page links to `detail?oid=NNN`. The script parses every
 listing (title, status, availability, address, city, rent), keeps only rooms
 in Zürich (drops parking / commercial, drops Winterthur / Dietikon / Dübendorf),
-and compares the `oid`s to the ones stored in `seen.json`. Anything unseen
-triggers one email (plain text + HTML) via Gmail SMTP, then gets recorded.
+and compares them to `seen.json`, which stores `{oid: content-fingerprint}`.
+WOKO reuses an `oid` when the same room is re-listed, so a listing counts as
+new if its `oid` is unseen **or** its content (title, date, address, city,
+rent) changed. Either triggers one email (plain text + HTML) via Gmail SMTP.
 
 ## Setup
 
